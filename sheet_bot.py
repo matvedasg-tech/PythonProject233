@@ -31,13 +31,10 @@ GROUP_ID = int(os.getenv("VK_GROUP_ID") or 0)
 SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or "").strip()
 WORKSHEET_NAME = (os.getenv("WORKSHEET_NAME") or "").strip()
 WARNING_PEER_ID = int(os.getenv("WARNING_PEER_ID") or 0)
-REPORT_USER_ID = int(os.getenv("REPORT_USER_ID") or 0)
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)
 
 COOLDOWN_SECONDS = 5
 user_cooldowns = {}
-last_warning_date = None
-last_report_date = None
 last_lesson_check = None
 last_unread_report = None
 
@@ -62,25 +59,38 @@ def db_conn():
 def init_db():
     with db_conn() as c:
         c.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                vk_id INTEGER PRIMARY KEY,
+                nickname TEXT UNIQUE
+            );
             CREATE TABLE IF NOT EXISTS lesson_status (
-                user_id INTEGER,
+                vk_id INTEGER,
                 lesson_num INTEGER,
-                status TEXT, -- 'sent', 'read'
+                status TEXT,
                 sent_at TEXT,
                 read_at TEXT,
-                PRIMARY KEY (user_id, lesson_num)
+                PRIMARY KEY (vk_id, lesson_num)
             );
         """)
 
-def mark_lesson_sent(user_id: int, lesson_num: int):
+def get_user_nickname(vk_id: int) -> str | None:
     with db_conn() as c:
-        c.execute("INSERT OR IGNORE INTO lesson_status (user_id, lesson_num, status, sent_at) VALUES (?, ?, 'sent', ?)",
-                  (user_id, lesson_num, datetime.now().isoformat()))
+        row = c.execute("SELECT nickname FROM users WHERE vk_id=?", (vk_id,)).fetchone()
+        return row['nickname'] if row else None
 
-def mark_lesson_read(user_id: int, lesson_num: int):
+def save_user_nickname(vk_id: int, nickname: str):
     with db_conn() as c:
-        c.execute("UPDATE lesson_status SET status='read', read_at=? WHERE user_id=? AND lesson_num=?",
-                  (datetime.now().isoformat(), user_id, lesson_num))
+        c.execute("INSERT OR REPLACE INTO users (vk_id, nickname) VALUES (?, ?)", (vk_id, nickname))
+
+def mark_lesson_sent(vk_id: int, lesson_num: int):
+    with db_conn() as c:
+        c.execute("INSERT OR IGNORE INTO lesson_status (vk_id, lesson_num, status, sent_at) VALUES (?, ?, 'sent', ?)",
+                  (vk_id, lesson_num, datetime.now().isoformat()))
+
+def mark_lesson_read(vk_id: int, lesson_num: int):
+    with db_conn() as c:
+        c.execute("UPDATE lesson_status SET status='read', read_at=? WHERE vk_id=? AND lesson_num=?",
+                  (datetime.now().isoformat(), vk_id, lesson_num))
 
 # ---------- Google auth ----------
 _creds = service_account.Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
@@ -150,7 +160,7 @@ def parse_date_to_dt(date_str: str) -> date | None:
             except ValueError: pass
     return None
 
-# ---------- СТАТИСТИКА (возвращено) ----------
+# ---------- СТАТИСТИКА ----------
 def get_agentometer() -> str:
     try: rows = fetch_rows()
     except Exception as e: return f"❌ Ошибка: {e}"
@@ -243,14 +253,14 @@ def load_lessons() -> dict:
             return json.load(f)
     except: return {}
 
-def send_lesson_announcement(vk, user_id: int, lesson_num: int, nickname: str):
+def send_lesson_announcement(vk, vk_id: int, lesson_num: int, nickname: str):
     lessons = load_lessons()
     if str(lesson_num) not in lessons: return False
     kb = VkKeyboard(inline=True)
     kb.add_button("📖 Получить урок", color=VkKeyboardColor.PRIMARY, payload={"cmd": "get_lesson", "num": lesson_num})
     try:
-        vk.messages.send(user_id=user_id, message=f"🔔 Привет, {nickname}!\nДоступен новый учебный материал (Урок {lesson_num}). Нажми на кнопку ниже.", keyboard=kb.get_keyboard(), random_id=get_random_id())
-        mark_lesson_sent(user_id, lesson_num)
+        vk.messages.send(user_id=vk_id, message=f"🔔 Привет, {nickname}!\nДоступен новый учебный материал (Урок {lesson_num}). Нажми на кнопку ниже.", keyboard=kb.get_keyboard(), random_id=get_random_id())
+        mark_lesson_sent(vk_id, lesson_num)
         return True
     except: return False
 
@@ -260,22 +270,33 @@ def daily_lesson_check(vk):
     if not lessons: return
     try: rows = fetch_rows()
     except: return
+    
     keys = list(rows[0].keys()) if rows else []
     key_nick = _find_key(keys, 'nickname')
     key_pos = _find_key(keys, 'должность')
     key_date = _find_key(keys, 'назначен')
-    key_vk = _find_key(keys, 'vk')
-    if not key_pos or not key_date or not key_vk: return
-    for row in rows:
-        if 'агент поддержки' not in str(row.get(key_pos, '')).lower(): continue
-        d = parse_date_to_dt(str(row.get(key_date, '')).strip())
-        if not d: continue
-        days = (today - d).days
-        if 1 <= days <= 10 and str(days) in lessons:
-            vk_raw = str(row.get(key_vk, '')).strip()
-            m = re.search(r'id(\d+)', vk_raw)
-            uid = int(m.group(1)) if m else (int(vk_raw) if vk_raw.isdigit() else 0)
-            if uid: send_lesson_announcement(vk, uid, days, row.get(key_nick, 'агент'))
+    
+    if not key_pos or not key_date or not key_nick: return
+
+    with db_conn() as c:
+        users = c.execute("SELECT vk_id, nickname FROM users").fetchall()
+
+    for user in users:
+        vk_id = user['vk_id']
+        nick = user['nickname']
+        
+        for row in rows:
+            if str(row.get(key_nick, '')).strip().lower() == nick.strip().lower():
+                if 'агент поддержки' not in str(row.get(key_pos, '')).lower():
+                    break
+                
+                d = parse_date_to_dt(str(row.get(key_date, '')).strip())
+                if not d: break
+                
+                days = (today - d).days
+                if 1 <= days <= 10 and str(days) in lessons:
+                    send_lesson_announcement(vk, vk_id, days, nick)
+                break
 
 def send_unread_report(vk):
     if not WARNING_PEER_ID: return
@@ -284,26 +305,35 @@ def send_unread_report(vk):
     if not lessons: return
     try: rows = fetch_rows()
     except: return
+    
     keys = list(rows[0].keys()) if rows else []
     key_nick = _find_key(keys, 'nickname')
     key_pos = _find_key(keys, 'должность')
     key_date = _find_key(keys, 'назначен')
-    key_vk = _find_key(keys, 'vk')
-    if not key_pos or not key_date or not key_vk: return
+    if not key_pos or not key_date or not key_nick: return
+
+    with db_conn() as c:
+        users = c.execute("SELECT vk_id, nickname FROM users").fetchall()
+
     unread = []
-    for row in rows:
-        if 'агент поддержки' not in str(row.get(key_pos, '')).lower(): continue
-        d = parse_date_to_dt(str(row.get(key_date, '')).strip())
-        if not d: continue
-        days = (today - d).days
-        if 1 <= days <= 10 and str(days) in lessons:
-            vk_raw = str(row.get(key_vk, '')).strip()
-            m = re.search(r'id(\d+)', vk_raw)
-            uid = int(m.group(1)) if m else (int(vk_raw) if vk_raw.isdigit() else 0)
-            if uid:
-                with db_conn() as c:
-                    st = c.execute("SELECT status FROM lesson_status WHERE user_id=? AND lesson_num=?", (uid, days)).fetchone()
-                    if st and st['status'] == 'sent': unread.append(row.get(key_nick, 'агент'))
+    for user in users:
+        vk_id = user['vk_id']
+        nick = user['nickname']
+        
+        for row in rows:
+            if str(row.get(key_nick, '')).strip().lower() == nick.strip().lower():
+                if 'агент поддержки' not in str(row.get(key_pos, '')).lower(): break
+                d = parse_date_to_dt(str(row.get(key_date, '')).strip())
+                if not d: break
+                
+                days = (today - d).days
+                if 1 <= days <= 10 and str(days) in lessons:
+                    with db_conn() as c:
+                        st = c.execute("SELECT status FROM lesson_status WHERE vk_id=? AND lesson_num=?", (vk_id, days)).fetchone()
+                        if st and st['status'] == 'sent':
+                            unread.append(nick)
+                break
+
     if unread:
         txt = "⚠️ Не прочитали сегодняшний урок:\n" + "\n".join(f"• {n}" for n in unread)
         try: vk.messages.send(peer_id=WARNING_PEER_ID, message=txt, random_id=get_random_id())
@@ -324,10 +354,111 @@ def handle_callback(event, vk):
 
 def handle_message(event, vk):
     msg = event.object.message
-    text = (msg.get("text") or "").strip().lower()
+    text = (msg.get("text") or "").strip()
     peer_id = msg["peer_id"]
     from_id = msg["from_id"]
+    
+    # Проверяем, это личные сообщения (ЛС) или беседа
+    is_dm = (peer_id == from_id)
+    
     if not text: return
+
+    # --- АДМИНСКАЯ КОМАНДА: РУЧНАЯ ВЫДАЧА ---
+    if from_id == ADMIN_ID and text.lower().startswith("/выдать "):
+        try:
+            parts = text.split()
+            if len(parts) < 3:
+                vk.messages.send(peer_id=peer_id, message="⚠️ Использование: /выдать NickName https://vk.com/id12345", random_id=get_random_id())
+                return
+            
+            nick = parts[1]
+            vk_link = parts[2]
+            
+            match_id = re.search(r'id(\d+)', vk_link)
+            if match_id:
+                target_vk_id = int(match_id.group(1))
+            else:
+                username = vk_link.strip('/').split('/')[-1]
+                try:
+                    res = vk.users.get(user_ids=username)
+                    if res: target_vk_id = res[0]['id']
+                    else:
+                        vk.messages.send(peer_id=peer_id, message="❌ Не удалось найти пользователя.", random_id=get_random_id())
+                        return
+                except:
+                    vk.messages.send(peer_id=peer_id, message="❌ Не удалось найти пользователя.", random_id=get_random_id())
+                    return
+
+            rows = fetch_rows()
+            keys = list(rows[0].keys()) if rows else []
+            key_nick = _find_key(keys, 'nickname')
+            found = False
+            if key_nick:
+                for r in rows:
+                    if str(r.get(key_nick, '')).strip().lower() == nick.lower():
+                        found = True
+                        break
+            
+            if not found:
+                vk.messages.send(peer_id=peer_id, message=f"⚠️ Ника '{nick}' нет в таблице. Выдаю принудительно.", random_id=get_random_id())
+
+            save_user_nickname(target_vk_id, nick)
+            
+            vk.messages.send(
+                peer_id=peer_id, 
+                message=f"✅ Успешно выдано — {nick} ([id{target_vk_id}|Профиль])", 
+                random_id=get_random_id(),
+                format="html"
+            )
+            
+            try:
+                vk.messages.send(user_id=target_vk_id, message=f"✅ Администратор выдал тебе доступ. Твой ник: {nick}.", random_id=get_random_id())
+            except: pass
+                
+        except Exception as e:
+            vk.messages.send(peer_id=peer_id, message=f"❌ Ошибка: {e}", random_id=get_random_id())
+        return
+    # -----------------------------------------
+
+    # --- ЛОГИКА ДЛЯ БЕСЕД И ЛС ---
+    
+    # Если это беседа - реагируем ТОЛЬКО на команды статистики
+    if not is_dm:
+        allowed_cmds = ["/агентометр", "/агентосчет", "/звоносчет", "/стата", "/help", "/помощь", "/start"]
+        if text.lower() not in allowed_cmds and not text.lower().startswith("/урок "):
+            return # В беседе молчим на всё остальное
+
+    # --- АВТОРИЗАЦИЯ (только для ЛС) ---
+    nickname = get_user_nickname(from_id)
+    if not nickname:
+        if not is_dm:
+            return # В беседе неавторизованных просто игнорируем
+        
+        if text.startswith("/"):
+            vk.messages.send(peer_id=peer_id, message="👋 Привет! Чтобы пользоваться ботом, напиши свой игровой никнейм (как в таблице).", random_id=get_random_id())
+            return
+        
+        try: rows = fetch_rows()
+        except: rows = []
+        keys = list(rows[0].keys()) if rows else []
+        key_nick = _find_key(keys, 'nickname')
+        
+        found = False
+        if key_nick:
+            for r in rows:
+                if str(r.get(key_nick, '')).strip().lower() == text.lower():
+                    found = True
+                    break
+        
+        if found:
+            save_user_nickname(from_id, text)
+            vk.messages.send(peer_id=peer_id, message=f"✅ Отлично, {text}! Ты авторизован. Теперь тебе доступны команды.", random_id=get_random_id())
+        else:
+            vk.messages.send(peer_id=peer_id, message="❌ Я не нашел тебя в составе. Проверь написание ника (он должен точно совпадать с таблицей).", random_id=get_random_id())
+        return
+
+    # --- КОМАНДЫ ---
+    text_lower = text.lower()
 
     user_cmds = user_cooldowns.setdefault(from_id, {})
     now = time.time()
@@ -336,43 +467,50 @@ def handle_message(event, vk):
         user_cmds[cmd] = now
         return True
 
-    if text in ("/help", "/start", "/помощь"):
+    if text_lower in ("/help", "/start", "/помощь"):
         if not check_cd("help"): return
-        vk.messages.send(peer_id=peer_id, message="📖 Команды:\n/агентометр\n/агентосчет\n/звоносчет\n/стата\n/урок N (админ)", random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message="📖 Команды:\n/агентометр\n/агентосчет\n/звоносчет\n/стата\n\n👑 Админ-команды:\n/урок N\n/выдать NickName Ссылка", random_id=get_random_id())
         return
 
-    if text == "/агентометр":
+    if text_lower == "/агентометр":
         if not check_cd("am"): return
         vk.messages.send(peer_id=peer_id, message=get_agentometer(), random_id=get_random_id())
         return
 
-    if text == "/агентосчет":
+    if text_lower == "/агентосчет":
         if not check_cd("ac"): return
         vk.messages.send(peer_id=peer_id, message=get_agent_count(), random_id=get_random_id())
         return
 
-    if text == "/звоносчет":
+    if text_lower == "/звоносчет":
         if not check_cd("zc"): return
         vk.messages.send(peer_id=peer_id, message=get_zvon_count(), random_id=get_random_id())
         return
 
-    if text == "/стата":
+    if text_lower == "/стата":
         if not check_cd("st"): return
         vk.messages.send(peer_id=peer_id, message=get_full_stats(), random_id=get_random_id())
         return
 
-    if from_id == ADMIN_ID and text.startswith("/урок "):
+    if from_id == ADMIN_ID and text_lower.startswith("/урок "):
         try:
-            num = int(text.split()[1])
-            rows = fetch_rows(); count = 0
+            num = int(text_lower.split()[1])
+            rows = fetch_rows()
+            with db_conn() as c:
+                users = c.execute("SELECT vk_id, nickname FROM users").fetchall()
+            
             keys = list(rows[0].keys()) if rows else []
-            kvk = _find_key(keys, 'vk'); kn = _find_key(keys, 'nickname'); kp = _find_key(keys, 'должность')
-            for r in rows:
-                if 'агент поддержки' in str(r.get(kp, '')).lower():
-                    raw = str(r.get(kvk, '')).strip()
-                    m = re.search(r'id(\d+)', raw)
-                    uid = int(m.group(1)) if m else (int(raw) if raw.isdigit() else 0)
-                    if uid and send_lesson_announcement(vk, uid, num, r.get(kn, 'агент')): count += 1
+            kn = _find_key(keys, 'nickname')
+            kp = _find_key(keys, 'должность')
+            
+            count = 0
+            for u in users:
+                for r in rows:
+                    if str(r.get(kn, '')).strip().lower() == u['nickname'].strip().lower():
+                        if 'агент поддержки' in str(r.get(kp, '')).lower():
+                            if send_lesson_announcement(vk, u['vk_id'], num, u['nickname']):
+                                count += 1
+                        break
             vk.messages.send(peer_id=peer_id, message=f"✅ Урок {num} разослан {count} чел.", random_id=get_random_id())
         except Exception as e:
             vk.messages.send(peer_id=peer_id, message=f"Ошибка: {e}", random_id=get_random_id())
