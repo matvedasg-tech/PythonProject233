@@ -1,0 +1,18 @@
+# Секретные файлы
+service_account.json
+.env
+
+# Базы данных
+*.db
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+
+# PyCharm
+.idea/
