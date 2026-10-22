@@ -72,15 +72,21 @@ def init_db():
                 PRIMARY KEY (vk_id, lesson_num)
             );
         """)
+        # Добавляем колонку role, если её нет (для старых баз)
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'agent'")
+            log.info("Колонка 'role' добавлена в таблицу users.")
+        except sqlite3.OperationalError:
+            pass # Колонка уже существует
 
 def get_user_nickname(vk_id: int) -> str | None:
     with db_conn() as c:
         row = c.execute("SELECT nickname FROM users WHERE vk_id=?", (vk_id,)).fetchone()
         return row['nickname'] if row else None
 
-def save_user_nickname(vk_id: int, nickname: str):
+def save_user(vk_id: int, nickname: str, role: str = 'agent'):
     with db_conn() as c:
-        c.execute("INSERT OR REPLACE INTO users (vk_id, nickname) VALUES (?, ?)", (vk_id, nickname))
+        c.execute("INSERT OR REPLACE INTO users (vk_id, nickname, role) VALUES (?, ?, ?)", (vk_id, nickname, role))
 
 def mark_lesson_sent(vk_id: int, lesson_num: int):
     with db_conn() as c:
@@ -262,7 +268,9 @@ def send_lesson_announcement(vk, vk_id: int, lesson_num: int, nickname: str):
         vk.messages.send(user_id=vk_id, message=f"🔔 Привет, {nickname}!\nДоступен новый учебный материал (Урок {lesson_num}). Нажми на кнопку ниже.", keyboard=kb.get_keyboard(), random_id=get_random_id())
         mark_lesson_sent(vk_id, lesson_num)
         return True
-    except: return False
+    except Exception as e:
+        log.warning(f"Не удалось отправить урок {vk_id}: {e}")
+        return False
 
 def daily_lesson_check(vk):
     today = datetime.now().date()
@@ -279,7 +287,7 @@ def daily_lesson_check(vk):
     if not key_pos or not key_date or not key_nick: return
 
     with db_conn() as c:
-        users = c.execute("SELECT vk_id, nickname FROM users").fetchall()
+        users = c.execute("SELECT vk_id, nickname FROM users WHERE role='agent' OR role IS NULL").fetchall()
 
     for user in users:
         vk_id = user['vk_id']
@@ -313,7 +321,7 @@ def send_unread_report(vk):
     if not key_pos or not key_date or not key_nick: return
 
     with db_conn() as c:
-        users = c.execute("SELECT vk_id, nickname FROM users").fetchall()
+        users = c.execute("SELECT vk_id, nickname FROM users WHERE role='agent' OR role IS NULL").fetchall()
 
     unread = []
     for user in users:
@@ -358,7 +366,6 @@ def handle_message(event, vk):
     peer_id = msg["peer_id"]
     from_id = msg["from_id"]
     
-    # Проверяем, это личные сообщения (ЛС) или беседа
     is_dm = (peer_id == from_id)
     
     if not text: return
@@ -399,14 +406,15 @@ def handle_message(event, vk):
                         found = True
                         break
             
+            role = 'agent' if found else 'staff'
             if not found:
-                vk.messages.send(peer_id=peer_id, message=f"⚠️ Ника '{nick}' нет в таблице. Выдаю принудительно.", random_id=get_random_id())
+                vk.messages.send(peer_id=peer_id, message=f"⚠️ Ника '{nick}' нет в таблице. Выдаю доступ как сотруднику (Staff).", random_id=get_random_id())
 
-            save_user_nickname(target_vk_id, nick)
+            save_user(target_vk_id, nick, role)
             
             vk.messages.send(
                 peer_id=peer_id, 
-                message=f"✅ Успешно выдано — {nick} ([id{target_vk_id}|Профиль])", 
+                message=f"✅ Успешно выдано — {nick} ([id{target_vk_id}|Профиль]) | Роль: {role}", 
                 random_id=get_random_id(),
                 format="html"
             )
@@ -418,48 +426,43 @@ def handle_message(event, vk):
         except Exception as e:
             vk.messages.send(peer_id=peer_id, message=f"❌ Ошибка: {e}", random_id=get_random_id())
         return
-    # -----------------------------------------
 
-    # --- ЛОГИКА ДЛЯ БЕСЕД И ЛС ---
-    
-    # Если это беседа - реагируем ТОЛЬКО на команды статистики
-    if not is_dm:
-        allowed_cmds = ["/агентометр", "/агентосчет", "/звоносчет", "/стата", "/help", "/помощь", "/start"]
-        if text.lower() not in allowed_cmds and not text.lower().startswith("/урок "):
-            return # В беседе молчим на всё остальное
-
-    # --- АВТОРИЗАЦИЯ (только для ЛС) ---
-    nickname = get_user_nickname(from_id)
-    if not nickname:
-        if not is_dm:
-            return # В беседе неавторизованных просто игнорируем
-        
-        if text.startswith("/"):
-            vk.messages.send(peer_id=peer_id, message="👋 Привет! Чтобы пользоваться ботом, напиши свой игровой никнейм (как в таблице).", random_id=get_random_id())
-            return
-        
-        try: rows = fetch_rows()
-        except: rows = []
-        keys = list(rows[0].keys()) if rows else []
-        key_nick = _find_key(keys, 'nickname')
-        
-        found = False
-        if key_nick:
-            for r in rows:
-                if str(r.get(key_nick, '')).strip().lower() == text.lower():
-                    found = True
-                    break
-        
-        if found:
-            save_user_nickname(from_id, text)
-            vk.messages.send(peer_id=peer_id, message=f"✅ Отлично, {text}! Ты авторизован. Теперь тебе доступны команды.", random_id=get_random_id())
-        else:
-            vk.messages.send(peer_id=peer_id, message="❌ Я не нашел тебя в составе. Проверь написание ника (он должен точно совпадать с таблицей).", random_id=get_random_id())
-        return
-
-    # --- КОМАНДЫ ---
+    # --- ЛОГИКА КОМАНД ---
     text_lower = text.lower()
 
+    if not is_dm:
+        allowed_in_chat = ["/агентометр", "/агентосчет", "/звоносчет", "/стата", "/help", "/помощь", "/start", "/урок ", "/база"]
+        if not any(text_lower.startswith(cmd) for cmd in allowed_in_chat):
+            return
+
+    # --- АВТОРИЗАЦИЯ (только для ЛС) ---
+    if is_dm:
+        nickname = get_user_nickname(from_id)
+        if not nickname:
+            if text.startswith("/"):
+                vk.messages.send(peer_id=peer_id, message="👋 Привет! Чтобы пользоваться ботом, напиши свой игровой никнейм (как в таблице).", random_id=get_random_id())
+                return
+            
+            try: rows = fetch_rows()
+            except: rows = []
+            keys = list(rows[0].keys()) if rows else []
+            key_nick = _find_key(keys, 'nickname')
+            
+            found = False
+            if key_nick:
+                for r in rows:
+                    if str(r.get(key_nick, '')).strip().lower() == text.lower():
+                        found = True
+                        break
+            
+            if found:
+                save_user(from_id, text, 'agent')
+                vk.messages.send(peer_id=peer_id, message=f"✅ Отлично, {text}! Ты авторизован. Теперь тебе доступны команды.", random_id=get_random_id())
+            else:
+                vk.messages.send(peer_id=peer_id, message="❌ Я не нашел тебя в составе. Проверь написание ника (он должен точно совпадать с таблицей).", random_id=get_random_id())
+            return
+
+    # --- ВЫПОЛНЕНИЕ КОМАНД ---
     user_cmds = user_cooldowns.setdefault(from_id, {})
     now = time.time()
     def check_cd(cmd: str) -> bool:
@@ -469,7 +472,7 @@ def handle_message(event, vk):
 
     if text_lower in ("/help", "/start", "/помощь"):
         if not check_cd("help"): return
-        vk.messages.send(peer_id=peer_id, message="📖 Команды:\n/агентометр\n/агентосчет\n/звоносчет\n/стата\n\n👑 Админ-команды:\n/урок N\n/выдать NickName Ссылка", random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message="📖 Команды:\n/агентометр\n/агентосчет\n/звоносчет\n/стата\n\n👑 Админ-команды:\n/урок N\n/выдать NickName Ссылка\n/база", random_id=get_random_id())
         return
 
     if text_lower == "/агентометр":
@@ -492,29 +495,35 @@ def handle_message(event, vk):
         vk.messages.send(peer_id=peer_id, message=get_full_stats(), random_id=get_random_id())
         return
 
-    if from_id == ADMIN_ID and text_lower.startswith("/урок "):
-        try:
-            num = int(text_lower.split()[1])
-            rows = fetch_rows()
+    # --- АДМИНСКИЕ КОМАНДЫ ---
+    if from_id == ADMIN_ID:
+        if text_lower == "/база":
             with db_conn() as c:
-                users = c.execute("SELECT vk_id, nickname FROM users").fetchall()
-            
-            keys = list(rows[0].keys()) if rows else []
-            kn = _find_key(keys, 'nickname')
-            kp = _find_key(keys, 'должность')
-            
-            count = 0
-            for u in users:
-                for r in rows:
-                    if str(r.get(kn, '')).strip().lower() == u['nickname'].strip().lower():
-                        if 'агент поддержки' in str(r.get(kp, '')).lower():
-                            if send_lesson_announcement(vk, u['vk_id'], num, u['nickname']):
-                                count += 1
-                        break
-            vk.messages.send(peer_id=peer_id, message=f"✅ Урок {num} разослан {count} чел.", random_id=get_random_id())
-        except Exception as e:
-            vk.messages.send(peer_id=peer_id, message=f"Ошибка: {e}", random_id=get_random_id())
-        return
+                users = c.execute("SELECT vk_id, nickname, role FROM users").fetchall()
+            if not users:
+                vk.messages.send(peer_id=peer_id, message="📭 База пуста. Никто не авторизовался.", random_id=get_random_id())
+            else:
+                msg = "🗂 В базе:\n"
+                for u in users:
+                    msg += f"• {u['nickname']} (ID: {u['vk_id']}) | {u['role']}\n"
+                vk.messages.send(peer_id=peer_id, message=msg, random_id=get_random_id())
+            return
+
+        if text_lower.startswith("/урок "):
+            try:
+                num = int(text_lower.split()[1])
+                with db_conn() as c:
+                    users = c.execute("SELECT vk_id, nickname, role FROM users").fetchall()
+                
+                count = 0
+                for u in users:
+                    if send_lesson_announcement(vk, u['vk_id'], num, u['nickname']):
+                        count += 1
+                        
+                vk.messages.send(peer_id=peer_id, message=f"✅ Урок {num} разослан {count} чел. (всем из базы)", random_id=get_random_id())
+            except Exception as e:
+                vk.messages.send(peer_id=peer_id, message=f"Ошибка: {e}", random_id=get_random_id())
+            return
 
 # ---------- Планировщик ----------
 def scheduler_loop(vk):
